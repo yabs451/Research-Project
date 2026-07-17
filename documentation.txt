@@ -1,0 +1,307 @@
+================================================================================
+RESEARCH IMPLEMENTATION DOCUMENTATION
+Honours research project — M6 forecasting universe, Dataset A
+Cumulative record: append new stages chronologically; do not delete history.
+No secrets (API tokens, account details) may ever be recorded in this file.
+================================================================================
+
+--------------------------------------------------------------------------------
+A. PROJECT DATA OBJECTIVE
+--------------------------------------------------------------------------------
+
+Purpose of Dataset A
+  Dataset A is the raw daily adjusted-close price history for the 100 official
+  assets of the M6 forecasting competition. It is the single upstream source
+  from which all later work (return calculation, rolling-origin evaluation
+  windows, model inference, quintile conversion, RPS scoring) will be derived.
+  Keeping it raw — no filling, no calendar alignment, no return computation —
+  ensures every downstream transformation is explicit, reproducible and
+  auditable.
+
+Official asset universe
+  The universe is defined by the `symbol` column of the official M6 file
+  supplied with the project (Data/assets_m6.csv; also copied unmodified to
+  data/raw/m6_official/assets_m6.csv for validation use). It contains exactly
+  100 unique symbols — 50 US stocks and 50 ETFs (including six London-listed
+  iShares ETFs with `.L` suffixes). The unique symbols are extracted
+  programmatically in first-occurrence order; the list is never hardcoded or
+  alphabetised, so the official ordering is preserved end-to-end.
+
+Required date range
+  2020-01-01 through 2023-02-03 inclusive. This spans a pre-competition
+  history buffer plus the M6 competition period. The buffer exists so that
+  each forecast origin can look back over a long context window (up to 512
+  daily observations) without reaching before the data start.
+
+Relationship to later rolling-origin evaluation
+  Later stages will evaluate forecasts on a rolling-origin basis across the
+  competition period. Each origin requires a trailing window of historical
+  returns; the earliest origin (around 2022-03-04) therefore needs roughly
+  513 prior price observations (513 prices -> 512 returns). Dataset A is
+  validated against that requirement but deliberately does not construct the
+  windows itself.
+
+--------------------------------------------------------------------------------
+B. STAGE 1 — INITIAL YAHOO FINANCE ACQUISITION (executed 2026-07-17)
+--------------------------------------------------------------------------------
+
+Source and tooling
+  Yahoo Finance via the `yfinance` Python package (v1.5.1), Python 3.10.11,
+  pandas 2.2.2. Script: scripts/download_dataset_a.py.
+
+Download parameters
+  start=2020-01-01, end=2023-02-04 (yfinance end is exclusive, so the last
+  included date is 2023-02-03), interval=1d, auto_adjust=False, actions=False,
+  progress=False, threads=True. A bulk 100-ticker download was attempted
+  first; symbols absent or entirely null were retried individually.
+
+Adjusted-close choice
+  The `Adj Close` field was extracted explicitly from yfinance's MultiIndex
+  column structure. Ordinary `Close` is never silently substituted: adjusted
+  prices incorporate dividends and splits, so returns computed from them
+  approximate total returns, matching how the M6 competition treated prices.
+
+Outputs
+  data/raw/yahoo/dataset_a_adjusted_close.csv
+    798 rows x 101 columns (`date` + 100 assets in official order),
+    2020-01-02 .. 2023-02-03, ascending, no duplicate dates.
+  reports/dataset_a_download_report.md
+    Full per-asset availability and validation report.
+
+Results
+  - 97 of 100 assets downloaded successfully.
+  - 3 assets failed entirely: DRE, RE, WRK. Yahoo Finance purges delisted
+    tickers, and all three had left the market after the competition window
+    (DRE acquired by Prologis, Oct 2022; RE renamed to EG, Jul 2023; WRK
+    merged into Smurfit WestRock, Jul 2024). They were retained as all-null
+    columns — never silently dropped — and the dataset was explicitly
+    reported as structurally valid but NOT data complete.
+  - CARR (first observation 2020-03-19) and OGN (2021-06-03) have genuinely
+    shorter histories because they are spin-offs (from United Technologies
+    and Merck respectively). These are real market facts, not download
+    errors; both fall short of 513 observations by 2022-03-04 (495 and 204).
+  - META/FB continuity: Yahoo's single `META` series contains the full
+    FB-era history (614 observations before the 2022-06-09 ticker change),
+    so one continuous `META` column represents the asset with no artificial
+    values at the change date.
+
+Raw-data rules followed (and why no filling occurred)
+  No weekend rows were added, no shared business-day calendar was built, no
+  forward/backward filling, interpolation, zero-substitution, return
+  calculation or standardisation was performed, and the official M6 file was
+  not used to patch Yahoo gaps. US and London exchanges observe different
+  holidays, so some dates are legitimately missing for some assets; filling
+  them here would silently bake a modelling decision into the "raw" layer and
+  make later methodological choices unauditable. All such decisions are
+  deferred to Stage 2 where they can be documented explicitly.
+
+--------------------------------------------------------------------------------
+C. STAGE 1B — EODHD REPAIR OF DRE, RE AND WRK (executed 2026-07-17)
+--------------------------------------------------------------------------------
+
+Why EODHD
+  EODHD retains delisted securities' histories (Yahoo does not), and the
+  official M6 organisers used EODHD during the competition, so it is the most
+  defensible provider for reconstructing the three missing series. An active
+  subscription was verified programmatically before download (token valid,
+  monthly plan, 100,000 requests/day, historical EOD endpoint accessible with
+  the `adjusted_close` field). The API token lives only in the local env file
+  (git-ignored, never tracked) and appears in no code, log, report or output.
+
+Script
+  scripts/repair_dataset_a_eodhd.py
+
+Endpoint and parameters (token excluded)
+  GET https://eodhd.com/api/eod/{IDENTIFIER}
+      from=2020-01-01, to=2023-02-03 (inclusive), period=d, order=a, fmt=json
+  Field extracted: `adjusted_close` only. `close`/`open`, acquirer series and
+  official M6 values were never substituted.
+
+Identifier discovery
+  Candidates were discovered programmatically from three sources — the
+  current US exchange symbol list (51,535 rows), the delisted US list
+  (58,583 rows) and the EODHD search endpoint — queried with both tickers
+  and company names (DRE / Duke Realty Corporation; RE / Everest Re Group;
+  EG / Everest Group; WRK / WestRock Company). Candidates were never accepted
+  on ticker text alone; company identity, coverage and return agreement with
+  the official M6 series all had to hold.
+
+Identifiers tested and outcomes
+  DRE:
+    DRE.US    (Duke Realty Corporation, delisted list) — ACCEPTED.
+              694 rows, 2020-01-02 .. 2022-10-03. Overlap vs official DRE
+              (restricted to <= 2022-10-03, see below): 170 observations,
+              return correlation 1.000000, median |dR| 4e-06, max 1.9e-05,
+              no major disagreements, no price-ratio jumps.
+    DRE-PL.US (a Duke Realty preferred line) — rejected: empty response.
+  RE:
+    EG.US     (Everest Group Ltd, active list) — ACCEPTED. EODHD stores one
+              continuous series under the current ticker: 779 rows,
+              2020-01-02 .. 2023-02-03, fully covering the pre-rename RE era.
+              Overlap vs official RE: 255 observations, correlation 1.000000,
+              median |dR| 1e-06, max 4e-06. No separate RE.US or "RE_old"
+              identifier exists in EODHD's current or delisted US lists.
+    (No other Everest candidates were returned by the lists or search.)
+  WRK:
+    WRK.US    (WestRock Co, delisted list) — ACCEPTED. 779 rows,
+              2020-01-02 .. 2023-02-03. Overlap vs official WRK: 255
+              observations, correlation 1.000000, median |dR| 7e-06,
+              max 2.6e-05.
+    SW.US     (Smurfit WestRock plc) — rejected: return correlation 0.297,
+              median |dR| 0.019. Confirms SW is NOT a continuation of the
+              original WestRock security and must not be substituted.
+    WEST.US / WESTW.US (Westrock Coffee — unrelated company) — rejected:
+              wrong identity, late starts, near-zero correlations.
+
+Validation method
+  For each candidate: align with the official M6 price series by date over
+  the overlapping window (2022-01-31 onward), compute daily simple returns
+  independently on both aligned series, and compare: overlap count, first and
+  last overlap dates, return correlation, median and maximum absolute return
+  difference, dates with |dR| > 0.01, and day-on-day jumps (> 1%) in the
+  price-level ratio (a corporate-action discontinuity screen). Acceptance
+  thresholds: >= 60 overlapping observations, correlation >= 0.99, median
+  |dR| <= 0.002, history starting by 2020-01-10 and reaching the required end
+  date, company identity confirmed by name. Price LEVELS were compared only
+  diagnostically: providers may adjust from different anchor dates, so levels
+  can differ while the security is identical; return agreement is the
+  identity test. No recovered series was rescaled to force agreement.
+
+Special handling decisions
+  DRE: the official M6 file freezes DRE's price at 48.20 from 2022-09-30
+    onward (the competition's zero-return treatment after the Prologis
+    acquisition). The official series was therefore truncated at 2022-10-03
+    for validation, and only genuine traded observations (through 2022-10-03,
+    DRE's final trading day) were retained in the repaired dataset. Dates
+    after that remain missing at this stage. PLD was not used.
+  RE/EG: RE remains the canonical Dataset A column name (the research
+    evaluation period ends before the July 2023 rename); the data provider
+    identifier was EG.US and is documented as such. No EG column exists.
+  WRK: only the original WestRock security (delisted WRK.US) was accepted.
+
+Data provenance
+  The unchanged JSON records for the three accepted identifiers are archived
+  under data/raw/recovered_sources/eodhd/ (dre_eodhd_raw.json,
+  re_eodhd_raw.json, wrk_eodhd_raw.json) together with the identifier,
+  company name, endpoint, parameters and retrieval timestamp. A token-leak
+  check is performed before every write.
+
+Outputs
+  data/raw/yahoo/dataset_a_adjusted_close_repaired.csv
+    798 rows x 101 columns; the 97 Yahoo columns byte-identical to the
+    original file (verified programmatically), plus validated EODHD series
+    for DRE (694 obs), RE (779 obs) and WRK (779 obs). The original
+    dataset_a_adjusted_close.csv is untouched.
+  reports/dataset_a_repair_report.md
+    Full candidate-by-candidate audit trail.
+
+--------------------------------------------------------------------------------
+D. METHODOLOGICAL DECISIONS (rationale)
+--------------------------------------------------------------------------------
+
+Official M6 data for validation only, never for history construction
+  The official file starts 2022-01-31, so it cannot supply the 2020-2021
+  context anyway; more fundamentally, using the evaluation-period source to
+  build model inputs would blur the line between data acquisition and the
+  competition ground truth. Using it purely as an independent cross-check
+  establishes identity of the recovered securities without contaminating the
+  input data.
+
+Why provider price levels may differ
+  Adjusted closes are back-computed from dividend/split factors relative to a
+  reference date; providers snapshot at different times and may round
+  differently. Two correct series for the same security can therefore differ
+  in level while agreeing in returns.
+
+Why return agreement is the key validation measure
+  Returns are invariant to the adjustment anchor, and all downstream research
+  quantities (forecasts, quintiles, RPS) are functions of returns, not
+  levels. A return correlation of ~1.0 with negligible absolute differences
+  identifies the security beyond reasonable doubt; a low correlation (e.g.
+  SW.US at 0.297) proves a different economic entity even when the name is
+  related.
+
+Why DRE must eventually be constant, never zero
+  After the acquisition, DRE shareholders' positions were converted; the
+  competition's convention was "no subsequent price change", i.e. zero
+  returns. Setting the price to zero would instead imply a -100% return — an
+  enormous fictitious crash. Stage 2 will carry the final price forward;
+  Stage 1B deliberately leaves post-2022-10-03 dates missing so the raw layer
+  records only genuine observations.
+
+Why RE remains the canonical symbol
+  The research evaluation period ends 2023-02-03, before the July 2023
+  RE -> EG rename. All official M6 artifacts identify the asset as RE, so the
+  research keeps that identifier; the provider mapping (EG.US) is recorded as
+  provenance metadata instead of leaking into the schema.
+
+Why CARR and OGN are not backfilled
+  Their short histories reflect real listing dates (2020 and 2021 spin-offs).
+  Inventing pre-listing prices would fabricate data. Later model inputs must
+  use the available history (fewer than 512 returns at early origins) rather
+  than forcing a fixed-length context.
+
+--------------------------------------------------------------------------------
+E. CURRENT STATUS (as of 2026-07-17)
+--------------------------------------------------------------------------------
+
+Completed
+  - Stage 1: Yahoo acquisition of Dataset A (97/100 assets) + report.
+  - Stage 1B: EODHD repair of DRE, RE, WRK with full validation; repaired
+    dataset written; all 100 assets now populated.
+
+Unresolved issues
+  - None blocking. Known, documented data facts (not defects): CARR and OGN
+    have genuinely shorter histories; DRE has no observations after
+    2022-10-03 (by design until Stage 2); London-listed ETFs have holiday
+    gaps on US trading days and vice versa.
+
+Stage 2 readiness
+  - Dataset A (repaired) is complete and validated; Stage 2 preprocessing MAY
+    begin. Stage 2 must: carry DRE's final price forward after 2022-10-03
+    (zero-return competition treatment), handle cross-exchange calendars
+    explicitly, and compute returns.
+
+Next planned stage
+  - Stage 2: preprocessing (calendar handling, DRE carry-forward, return
+    calculation), then rolling-origin window construction.
+
+--------------------------------------------------------------------------------
+F. REPRODUCIBILITY
+--------------------------------------------------------------------------------
+
+Scripts
+  scripts/download_dataset_a.py       (Stage 1; supports --force re-download)
+  scripts/repair_dataset_a_eodhd.py   (Stage 1B; requires EODHD token in the
+                                       local env file — never committed)
+
+Inputs
+  Data/assets_m6.csv                          official M6 universe/prices
+  data/raw/m6_official/assets_m6.csv          unmodified copy for validation
+
+Outputs
+  data/raw/yahoo/dataset_a_adjusted_close.csv            Stage 1 raw dataset
+  data/raw/yahoo/dataset_a_adjusted_close_repaired.csv   Stage 1B repaired
+  data/raw/recovered_sources/eodhd/{dre,re,wrk}_eodhd_raw.json
+  reports/dataset_a_download_report.md
+  reports/dataset_a_repair_report.md
+
+Environment
+  Python 3.10.11 (Windows 11); pandas 2.2.2; yfinance 1.5.1;
+  python-dotenv 1.2.2; requests 2.32.5. Dependencies listed in
+  requirements.txt. Execution date for both stages: 2026-07-17.
+
+Warnings and limitations
+  - Yahoo Finance data for delisted tickers can disappear retroactively; the
+    archived EODHD JSON files preserve the recovered series independently.
+  - Yahoo adjusted closes are subject to retrospective revision (dividend
+    adjustments); a re-download at a later date may differ slightly.
+  - pandas' default CSV float parsing is not bit-exact round-trip; the repair
+    script therefore treats the original CSV as text when copying the 97
+    untouched columns, guaranteeing byte-identical preservation.
+  - The EODHD API token and all personal subscription details are excluded
+    from every artifact, including this file.
+
+================================================================================
+END OF CURRENT RECORD — append future stages below this line's section style.
+================================================================================
