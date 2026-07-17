@@ -242,29 +242,31 @@ Why CARR and OGN are not backfilled
   than forcing a fixed-length context.
 
 --------------------------------------------------------------------------------
-E. CURRENT STATUS (as of 2026-07-17)
+E. CURRENT STATUS (as of 2026-07-17, updated after Stage 2)
 --------------------------------------------------------------------------------
 
 Completed
   - Stage 1: Yahoo acquisition of Dataset A (97/100 assets) + report.
   - Stage 1B: EODHD repair of DRE, RE, WRK with full validation; repaired
     dataset written; all 100 assets now populated.
+  - Stage 2: preprocessing onto the shared weekday calendar, forward-filling,
+    DRE post-acquisition treatment, and daily log-return construction
+    (see the Stage 2 section below). All 9 focused tests pass.
 
 Unresolved issues
   - None blocking. Known, documented data facts (not defects): CARR and OGN
-    have genuinely shorter histories; DRE has no observations after
-    2022-10-03 (by design until Stage 2); London-listed ETFs have holiday
-    gaps on US trading days and vice versa.
+    have genuinely shorter histories, so they have fewer than 512 valid
+    returns at the first forecast origin (CARR 511, OGN 210); the model-input
+    stage must accommodate shorter contexts rather than padding.
 
-Stage 2 readiness
-  - Dataset A (repaired) is complete and validated; Stage 2 preprocessing MAY
-    begin. Stage 2 must: carry DRE's final price forward after 2022-10-03
-    (zero-return competition treatment), handle cross-exchange calendars
-    explicitly, and compute returns.
+Stage 3 readiness
+  - The processed price and return panels are complete, validated and contain
+    all 13 M6 Friday anchor dates. Stage 3 rolling-origin construction MAY
+    begin.
 
 Next planned stage
-  - Stage 2: preprocessing (calendar handling, DRE carry-forward, return
-    calculation), then rolling-origin window construction.
+  - Stage 3: rolling-origin window construction (13 origins), then model
+    inference, quintile probability conversion and RPS evaluation.
 
 --------------------------------------------------------------------------------
 F. REPRODUCIBILITY
@@ -274,6 +276,9 @@ Scripts
   scripts/download_dataset_a.py       (Stage 1; supports --force re-download)
   scripts/repair_dataset_a_eodhd.py   (Stage 1B; requires EODHD token in the
                                        local env file — never committed)
+  scripts/preprocess_dataset_a.py     (Stage 2; offline, deterministic,
+                                       safe to rerun; no API key needed)
+  tests/test_preprocess_dataset_a.py  (Stage 2 focused rule tests; pytest)
 
 Inputs
   Data/assets_m6.csv                          official M6 universe/prices
@@ -283,13 +288,17 @@ Outputs
   data/raw/yahoo/dataset_a_adjusted_close.csv            Stage 1 raw dataset
   data/raw/yahoo/dataset_a_adjusted_close_repaired.csv   Stage 1B repaired
   data/raw/recovered_sources/eodhd/{dre,re,wrk}_eodhd_raw.json
+  data/processed/dataset_a_adjusted_close_weekday.csv    Stage 2 prices
+  data/processed/dataset_a_daily_log_returns.csv         Stage 2 returns
+  data/metadata/dataset_a_preprocessing_summary.csv      Stage 2 per-asset facts
   reports/dataset_a_download_report.md
   reports/dataset_a_repair_report.md
+  reports/dataset_a_preprocessing_report.md
 
 Environment
-  Python 3.10.11 (Windows 11); pandas 2.2.2; yfinance 1.5.1;
-  python-dotenv 1.2.2; requests 2.32.5. Dependencies listed in
-  requirements.txt. Execution date for both stages: 2026-07-17.
+  Python 3.10.11 (Windows 11); pandas 2.2.2; numpy 1.26.4; yfinance 1.5.1;
+  python-dotenv 1.2.2; requests 2.32.5; pytest 9.1.1. Dependencies listed in
+  requirements.txt. Execution date for Stages 1, 1B and 2: 2026-07-17.
 
 Warnings and limitations
   - Yahoo Finance data for delisted tickers can disappear retroactively; the
@@ -301,6 +310,123 @@ Warnings and limitations
     untouched columns, guaranteeing byte-identical preservation.
   - The EODHD API token and all personal subscription details are excluded
     from every artifact, including this file.
+
+--------------------------------------------------------------------------------
+G. STAGE 2 — PREPROCESSING AND DAILY LOG-RETURN CONSTRUCTION
+   (executed 2026-07-17)
+--------------------------------------------------------------------------------
+
+Purpose
+  Convert the raw repaired Dataset A into (i) a cleaned adjusted-close panel
+  on one shared calendar and (ii) a daily log-return panel — the direct
+  inputs for the later rolling-origin evaluation. The stage performs exactly
+  four substantive transformations (weekday reindexing, post-inception
+  forward-filling, the official DRE treatment, log-return calculation) and
+  nothing else: no averaging, smoothing, normalisation, standardisation,
+  clipping or outlier removal, and no statistics fitted on the data.
+
+Input
+  data/raw/yahoo/dataset_a_adjusted_close_repaired.csv (798 rows x 101
+  columns, 2020-01-02 .. 2023-02-03). Structural validation before
+  processing: `date` first column; exactly 100 asset columns matching the
+  official first-occurrence order (names/order confirmed against
+  data/raw/m6_official/assets_m6.csv — its prices were never used); unique
+  sorted dates with the expected endpoints; no zero or negative prices. The
+  input file's SHA-256 hash was recorded before and re-verified after
+  processing: the raw file was not modified.
+
+Shared Monday-to-Friday calendar
+  A single weekday calendar from 2020-01-02 through 2023-02-03 (807 dates, no
+  Saturdays/Sundays) replaces the raw file's union-of-exchanges calendar.
+  Rationale: the universe mixes US-listed and London-listed assets whose
+  exchanges observe different holidays; cross-sectional work (a return for
+  every asset on every evaluation date) requires one common index. Individual
+  per-exchange calendars would leave the panels ragged. Reindexing added 9
+  dates — weekdays on which no exchange in the universe traded (shared
+  holidays such as Good Friday and Christmas-period closures).
+
+Forward-filling (and why it is legitimate)
+  For each asset independently, the most recently observed price is carried
+  forward across later missing weekdays, starting only AFTER the asset's
+  first genuine observation. A missing weekday price means the market was
+  closed; a holder's position could not change value that day, so repeating
+  the last price — which was genuinely observed earlier, never taken from the
+  future, another asset, or the official file — is the faithful
+  representation, and it yields exactly zero log return on closure days
+  without ever setting a price to zero (log of a zero price would be
+  undefined; a zero price would mean a -100% return). Backward-filling and
+  interpolation are prohibited because both leak future information.
+  Results: 2,851 cells filled in total. Typical US-listed assets: 28 cells
+  (US public holidays); London-listed ETFs: 26 cells (UK holidays, longest
+  internal gap 2 weekdays, e.g. Christmas + Boxing Day); CARR 26; OGN 16;
+  DRE 113 (24 ordinary holiday fills + 89 post-acquisition weekdays, see
+  below). No internal gap longer than 5 consecutive weekdays existed
+  anywhere before filling.
+
+DRE treatment (official M6 convention)
+  Verified: DRE's final genuine observation is 2022-10-03 at 48.20 (positive,
+  non-null). That price is carried forward over the 89 subsequent weekdays
+  through 2023-02-03, so the processed DRE price is constant after the
+  Prologis acquisition and every DRE log return after 2022-10-03 is exactly
+  zero — implementing the M6 instruction of "no subsequent price change".
+  No PLD prices were used and no jump was introduced at the acquisition date.
+
+CARR and OGN (no backfilling before inception)
+  First genuine dates are unchanged by preprocessing: CARR 2020-03-19 and
+  OGN 2021-05-14 (Yahoo's series includes OGN's when-issued trading ahead of
+  the June-2021 Merck spin-off completion, so its genuine start is earlier
+  than the formal distribution date). All weekdays before each first genuine
+  observation remain missing: inventing pre-listing prices would fabricate
+  data for securities that did not yet trade.
+
+Daily log returns
+  Formula: log_return[t] = log(price[t] / price[t-1]), implemented as
+  np.log(processed_prices).diff(), per asset, on the shared weekday index in
+  official column order. A return is missing exactly where the current or
+  preceding processed price is missing (pre-inception periods and the first
+  calendar row); missing returns were NOT replaced with zero — a zero return
+  asserts "no movement", which is only true for genuine closure days already
+  handled by forward-filling. Unchanged prices give exactly 0.0 (the fill is
+  an identical float, so the ratio is exactly 1). No infinities exist
+  (prices are strictly positive; verified programmatically). Valid returns:
+  806 of 807 rows for 98 assets; CARR 751; OGN 450.
+
+Output files
+  data/processed/dataset_a_adjusted_close_weekday.csv   807 x 101
+  data/processed/dataset_a_daily_log_returns.csv        807 x 101
+  data/metadata/dataset_a_preprocessing_summary.csv     per-asset dates/counts
+  reports/dataset_a_preprocessing_report.md             full validation report
+  No raw file was overwritten (hash-verified).
+
+Validation results
+  All checks passed: 807 weekday rows, correct endpoints, no weekends, no
+  duplicates, official column order preserved, all 100 assets present,
+  forward-filling never touched a leading missing period, DRE constant with
+  zero returns after 2022-10-03, no infinite or invalid returns, and all 13
+  M6 Friday anchor dates (2022-03-04 .. 2023-02-03, four-week spacing) exist
+  in both panels. Focused pytest suite
+  (tests/test_preprocess_dataset_a.py): 9 tests, all passing — including
+  synthetic-data tests of the fill rule, the log-return formula, the
+  missing-not-zero rule and the no-infinity rule, plus integration tests on
+  the actual outputs.
+
+Remaining limitations
+  - CARR has 511 and OGN has 210 valid returns on or before the first
+    forecast origin (2022-03-04) — below the 512-observation context length.
+    All other assets have at least 512 (maximum 566). The model-input stage
+    must use the available shorter history for these two assets rather than
+    padding or fabricating observations.
+  - Forward-filled closure days are constant-price observations by
+    construction; any later volatility estimates will see these as zero
+    returns, which is the intended competition-consistent interpretation.
+
+Explicitly not done in this stage
+  No rolling-origin windows, model contexts, forecasts, quintile targets or
+  RPS calculations were created; no statistical scaling, averaging,
+  smoothing, clipping or outlier removal occurred anywhere.
+
+Next planned stage
+  Stage 3: rolling-origin construction over the 13 M6 Friday anchors.
 
 ================================================================================
 END OF CURRENT RECORD — append future stages below this line's section style.
