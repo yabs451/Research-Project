@@ -252,21 +252,24 @@ Completed
   - Stage 2: preprocessing onto the shared weekday calendar, forward-filling,
     DRE post-acquisition treatment, and daily log-return construction
     (see the Stage 2 section below). All 9 focused tests pass.
+  - Stage 3: construction and validation of the 12 M6 rolling-origin model
+    contexts (see the Stage 3 section below). All 8 focused tests pass.
 
 Unresolved issues
-  - None blocking. Known, documented data facts (not defects): CARR and OGN
-    have genuinely shorter histories, so they have fewer than 512 valid
-    returns at the first forecast origin (CARR 511, OGN 210); the model-input
-    stage must accommodate shorter contexts rather than padding.
+  - None blocking. Known, documented data facts (not defects): CARR has 511
+    valid context returns in round 1 (512 thereafter); OGN is short in every
+    round (210 valid returns in round 1 rising by 20 per round to 430 in
+    round 12); the model-wrapper stage must accommodate shorter contexts
+    rather than padding. DRE forecasts in post-acquisition rounds must
+    respect the known-zero competition treatment.
 
-Stage 3 readiness
-  - The processed price and return panels are complete, validated and contain
-    all 13 M6 Friday anchor dates. Stage 3 rolling-origin construction MAY
-    begin.
+Stage 4 readiness
+  - The 12 rolling-origin contexts are built, validated and ready for the
+    model-wrapper stage.
 
 Next planned stage
-  - Stage 3: rolling-origin window construction (13 origins), then model
-    inference, quintile probability conversion and RPS evaluation.
+  - Stage 4: model inference over the 12 contexts, then realised M6 target
+    construction, quintile probability conversion and RPS evaluation.
 
 --------------------------------------------------------------------------------
 F. REPRODUCIBILITY
@@ -279,6 +282,9 @@ Scripts
   scripts/preprocess_dataset_a.py     (Stage 2; offline, deterministic,
                                        safe to rerun; no API key needed)
   tests/test_preprocess_dataset_a.py  (Stage 2 focused rule tests; pytest)
+  scripts/build_rolling_origins.py    (Stage 3; offline, deterministic,
+                                       safe to rerun; no API key needed)
+  tests/test_build_rolling_origins.py (Stage 3 focused rule tests; pytest)
 
 Inputs
   Data/assets_m6.csv                          official M6 universe/prices
@@ -291,9 +297,13 @@ Outputs
   data/processed/dataset_a_adjusted_close_weekday.csv    Stage 2 prices
   data/processed/dataset_a_daily_log_returns.csv         Stage 2 returns
   data/metadata/dataset_a_preprocessing_summary.csv      Stage 2 per-asset facts
+  data/processed/rolling_origins/round_01..12_context.csv  Stage 3 contexts
+  data/metadata/m6_round_schedule.csv                    Stage 3 round schedule
+  data/metadata/rolling_origin_availability.csv          Stage 3 availability
   reports/dataset_a_download_report.md
   reports/dataset_a_repair_report.md
   reports/dataset_a_preprocessing_report.md
+  reports/rolling_origin_construction_report.md
 
 Environment
   Python 3.10.11 (Windows 11); pandas 2.2.2; numpy 1.26.4; yfinance 1.5.1;
@@ -427,6 +437,100 @@ Explicitly not done in this stage
 
 Next planned stage
   Stage 3: rolling-origin construction over the 13 M6 Friday anchors.
+
+--------------------------------------------------------------------------------
+H. STAGE 3 — ROLLING-ORIGIN MODEL-CONTEXT CONSTRUCTION
+   (executed 2026-07-17)
+--------------------------------------------------------------------------------
+
+Purpose of rolling-origin evaluation
+  Rather than judging models on a single train/test split, the research
+  re-forecasts at every scored M6 round: at each forecast origin the model
+  sees only history up to that date and predicts the following evaluation
+  period. Repeating this across 12 consecutive rounds produces an
+  out-of-sample evaluation that mirrors exactly what a live M6 participant
+  faced, and prevents any single lucky or unlucky period from dominating
+  conclusions.
+
+Round schedule
+  13 consecutive Friday anchors, four weeks apart, define 12 rounds:
+  2022-03-04, 2022-04-01, 2022-04-29, 2022-05-27, 2022-06-24, 2022-07-22,
+  2022-08-19, 2022-09-16, 2022-10-14, 2022-11-11, 2022-12-09, 2023-01-06,
+  2023-02-03. For round r, anchor r is the forecast origin (context end) and
+  anchor r+1 is the evaluation end; each round's evaluation end is the next
+  round's origin (verified). Submission deadlines were the Sundays two days
+  after each origin Friday, which is why the origin-date return is
+  legitimately part of the model input: the Friday close was public before
+  the submission deadline.
+
+Context versus forecast dates
+  Context dates (512 shared weekdays ending on and including the origin) are
+  what a model may see. Forecast dates (the following 20 shared weekdays,
+  ending on the next anchor) are what is being predicted and are entirely
+  excluded from model input — including any of them would leak the future.
+  Both ranges for every round were validated against the pre-specified
+  official table and match exactly (round 1 context 2020-03-19..2022-03-04,
+  forecast 2022-03-07..2022-04-01; ... ; round 12 context
+  2021-01-21..2023-01-06, forecast 2023-01-09..2023-02-03).
+
+Context movement and overlap
+  Each origin lies exactly 20 weekday rows after the previous one, so each
+  new context drops its oldest 20 dates and appends the 20 newest observed
+  dates; consecutive contexts share 492 of 512 dates (verified). Contexts
+  overlap because they are histories; the 12 evaluation periods are strictly
+  disjoint (verified), so no realised outcome is ever scored twice.
+
+Fixed 512-weekday context and the missing-history rule
+  512 refers to 512 shared weekday time positions, not 512 non-null values
+  per asset. Per-asset windows were never extended backwards to compensate
+  for missing values, no leading gaps were filled or zero-padded, and no
+  asset or round was discarded. CARR has 511 valid returns in round 1 (its
+  first context date is its first price date, whose return is undefined) and
+  the full 512 from round 2 onward. OGN, listed May 2021, is short in every
+  round: 210 valid returns in round 1, rising by 20 each round to 430 in
+  round 12. No other asset-round pair is short (verified across all 1,200
+  combinations). Model-specific handling of short histories is deferred to
+  the model-wrapper stage.
+
+DRE consideration for later modelling
+  Rounds 9-12 have context ends after DRE's final trading day (2022-10-03);
+  in those contexts DRE's post-acquisition returns are exactly zero — the
+  Stage 2 competition treatment, copied unchanged (verified; no PLD data,
+  no recalculation). Documented future rule, not implemented here: when
+  forecasts are generated for post-acquisition rounds, DRE's competition
+  return is known to remain zero, and forecast generation must respect that
+  known-zero treatment rather than modelling the stale series as if it
+  still traded.
+
+Files produced
+  data/processed/rolling_origins/round_01_context.csv .. round_12_context.csv
+    (each 512 rows x 101 columns: date + 100 assets, official order)
+  data/metadata/m6_round_schedule.csv        (12 rounds: deadlines, origins,
+                                              context/forecast ranges, files)
+  data/metadata/rolling_origin_availability.csv (1,200 round-asset rows of
+                                              validity counts and dates)
+  reports/rolling_origin_construction_report.md
+
+Validation results
+  All checks passed: 13 anchors present in both Stage 2 panels; every
+  forecast period spans exactly 20 weekday rows with no overlap between
+  consecutive periods; every context has exactly 512 rows and 100 asset
+  columns, ends on its origin, and contains no date after it; computed
+  context/forecast ranges equal the pre-specified official table; context
+  values are byte-for-byte copies of the Stage 2 return file (written from
+  an unparsed string copy; equality verified in tests); Stage 2 input files
+  confirmed unchanged via SHA-256. Focused pytest suite
+  (tests/test_build_rolling_origins.py): 8 tests, all passing.
+
+Explicitly not done in this stage
+  No model inference, no realised M6 targets, no quintile probabilities, no
+  RPS, no future-return files, and no descriptive statistics or
+  transformations of the returns — Stage 3 is slicing and validation only.
+
+Next planned stage
+  Stage 4: model wrappers and inference over the 12 contexts, followed by
+  realised target construction, quintile probability conversion and RPS
+  evaluation.
 
 ================================================================================
 END OF CURRENT RECORD — append future stages below this line's section style.
